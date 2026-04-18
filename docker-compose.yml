@@ -1,0 +1,227 @@
+version: '3.8'
+
+services:
+  minio:
+    image: minio/minio:RELEASE.2024-03-30T09-41-56Z
+    container_name: minio
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=minioadmin
+    command: server /data --console-address ":9001"
+    volumes:
+      - ./data/minio:/data
+    networks:
+      - mlops-net
+
+  minio-init:
+    image: minio/mc:latest
+    container_name: minio-init
+    depends_on:
+      - minio
+    volumes:
+      - ./contratos:/contratos
+    entrypoint: >
+      /bin/sh -c "
+      sleep 5;
+      mc alias set myminio http://minio:9000 minioadmin minioadmin;
+      mc mb myminio/mlops-data || true;
+      mc mb myminio/warehouse || true;
+      mc mb myminio/landing-zone || true;
+      mc mb myminio/raw || true;
+      mc mb myminio/trusted || true;
+      mc mb myminio/mlflow-artifacts || true;
+      mc mb myminio/airflow-logs || true;
+      mc mb myminio/model-contracts || true;
+      mc cp --recursive /contratos/ myminio/model-contracts/ || true;
+      exit 0;
+      "
+    networks:
+      - mlops-net
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: postgres-metastore
+    environment:
+      - POSTGRES_USER=hive
+      - POSTGRES_PASSWORD=hive
+      - POSTGRES_DB=metastore
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - mlops-net
+
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.11.3
+    container_name: mlflow-server
+    ports:
+      - "5000:5000"
+    environment:
+      - AWS_ACCESS_KEY_ID=minioadmin
+      - AWS_SECRET_ACCESS_KEY=minioadmin
+      - AWS_REGION=us-east-1
+      - MLFLOW_S3_ENDPOINT_URL=http://minio:9000
+    entrypoint: >
+      /bin/sh -c "
+      pip install psycopg2-binary boto3 &&
+      mlflow server
+      --backend-store-uri postgresql://hive:hive@postgres:5432/metastore
+      --default-artifact-root s3://mlflow-artifacts/
+      --host 0.0.0.0
+      "
+    depends_on:
+      - postgres
+      - minio
+    networks:
+      - mlops-net
+
+  trino:
+    image: trinodb/trino:443
+    container_name: trino
+    depends_on:
+      - postgres
+      - minio
+    ports:
+      - "8081:8080"
+    volumes:
+      - ./trino/etc:/etc/trino
+    networks:
+      - mlops-net
+
+  jupyterlab:
+    build:
+      context: ./jupyter
+    container_name: jupyterlab
+    ports:
+      - "8888:8888"
+    command: start-notebook.sh --ServerApp.token='' --ServerApp.password=''
+    environment:
+      - JUPYTER_ENABLE_LAB=yes
+      - AWS_ACCESS_KEY_ID=minioadmin
+      - AWS_SECRET_ACCESS_KEY=minioadmin
+      - AWS_S3_ENDPOINT=http://minio:9000
+      - MLFLOW_S3_ENDPOINT_URL=http://minio:9000
+    volumes:
+      - ./jupyter/notebooks:/home/jovyan/work
+    networks:
+      - mlops-net
+    depends_on:
+      - minio
+      - trino
+
+  airflow-init:
+    image: apache/airflow:2.9.1
+    container_name: airflow-init
+    depends_on:
+      - postgres
+    environment:
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://hive:hive@postgres:5432/airflow
+    user: "0:0"
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+      - ./airflow/plugins:/opt/airflow/plugins
+      - /var/run/docker.sock:/var/run/docker.sock
+    entrypoint: /bin/bash
+    command: >
+      -c "
+      chmod 666 /var/run/docker.sock &&
+      mkdir -p /opt/airflow/logs /opt/airflow/dags /opt/airflow/plugins &&
+      chown -R 50000:0 /opt/airflow &&
+      su -s /bin/bash airflow -c 'airflow db migrate && airflow users create -u admin -p admin -f Admin -l User -r Admin -e admin@example.com || true'
+      "
+    networks:
+      - mlops-net
+
+  airflow-webserver:
+    image: apache/airflow:2.9.1
+    container_name: airflow-webserver
+    ports:
+      - "8088:8080"
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    environment:
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://hive:hive@postgres:5432/airflow
+      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+      - AIRFLOW__CORE__LOAD_EXAMPLES=False
+      - _PIP_ADDITIONAL_REQUIREMENTS=boto3 docker apache-airflow-providers-docker
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+      - ./airflow/plugins:/opt/airflow/plugins
+    command: airflow webserver
+    networks:
+      - mlops-net
+
+  airflow-scheduler:
+    image: apache/airflow:2.9.1
+    container_name: airflow-scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    environment:
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://hive:hive@postgres:5432/airflow
+      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+      - AIRFLOW__CORE__LOAD_EXAMPLES=False
+      - _PIP_ADDITIONAL_REQUIREMENTS=boto3 docker apache-airflow-providers-docker
+      - AWS_ACCESS_KEY_ID=minioadmin
+      - AWS_SECRET_ACCESS_KEY=minioadmin
+      - AWS_S3_ENDPOINT=http://minio:9000
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+      - ./airflow/plugins:/opt/airflow/plugins
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: airflow scheduler
+    networks:
+      - mlops-net
+
+  # MLOps Auto-Builder (Compila a imagem customizada silenciosamente pro usuario)
+  builder-mlops-worker:
+    image: worker-mlops:latest
+    build:
+      context: ./mlops-worker
+      dockerfile: Dockerfile
+    command: /bin/true
+
+  # Data Engineering Auto-Builder
+  builder-data-worker:
+    image: worker-data:latest
+    build:
+      context: ./mlops-data-worker
+      dockerfile: Dockerfile
+    command: /bin/true
+
+  fastapi-server:
+    image: mlops-api:latest
+    container_name: fastapi-server
+    ports:
+      - "8000:8000"
+    environment:
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
+      - MLFLOW_S3_ENDPOINT_URL=http://minio:9000
+      - AWS_ACCESS_KEY_ID=minioadmin
+      - AWS_SECRET_ACCESS_KEY=minioadmin
+    depends_on:
+      - mlflow
+      - minio
+    networks:
+      - mlops-net
+
+  builder-mlops-api:
+    image: mlops-api:latest
+    build:
+      context: ./mlops-api
+      dockerfile: Dockerfile
+    command: /bin/true
+
+networks:
+  mlops-net:
+    name: mlops-net
+    driver: bridge
